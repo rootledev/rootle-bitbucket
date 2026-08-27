@@ -292,22 +292,12 @@ fn repo_dirs(root: &Path) -> Vec<String> {
     };
     let mut names: Vec<String> = entries
         .flatten()
-        .filter(|e| {
-            e.file_type().is_ok_and(|t| t.is_dir())
-                && !SKIP_REPO_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
-        })
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
     names
 }
-
-/// Top-level directories never served as repos: the suite's lifecycle
-/// group roots the adapter's disk cache at `<fixture>/cache` — a
-/// real-cache adapter materializes it, and serving it back would make
-/// the walk chase its own cache (the reference adapter skips exactly
-/// this class of directory via SKIP_DIRS).
-const SKIP_REPO_DIRS: &[&str] = &["cache"];
 
 /// Content-derived head: FNV-1a over the sorted repo files (path,
 /// length, bytes). Any content change moves the "commit", which is
