@@ -1,16 +1,17 @@
 //! Protocol dispatch: one method per arm, the wire shapes from
 //! doc/provider-protocol.md (v1.3). Capabilities declare the split:
 //! `code_search: false, file_search: true` — Bitbucket Cloud has no
-//! code-search API; filename search walks the commit-pinned tree and
-//! serves legal path-only hits.
+//! code-search index; queries are answered by walking the
+//! commit-pinned tree (path/extension terms as path-only hits, bare
+//! terms by grepping the fetched blobs).
 //!
-//! Layout: this file is the surface — handler state, dispatch, and
-//! the wire error taxonomy. The method bodies live in sibling
-//! submodules by protocol concern: `initialize.rs` (handshake +
-//! cache re-rooting), `search.rs` (`search/repos`, `org/repos`),
-//! `tree.rs` (branch → commit walk + revalidation), `blob.rs`
-//! (`repo/blob`), `urls.rs` (`repo/web_url`, `org/url`,
-//! `repo/clone_url`), `code.rs` (`search/code` as path-only hits).
+//! Layout: this file is the surface — handler state, dispatch, the
+//! $/partial plumbing, and the wire error taxonomy. The method bodies
+//! live in sibling submodules by protocol concern: `initialize.rs`
+//! (handshake + cache re-rooting), `search.rs` (`search/repos`,
+//! `org/repos`), `tree.rs` (branch → commit walk + revalidation),
+//! `blob.rs` (`repo/blob`), `urls.rs` (`repo/web_url`, `org/url`,
+//! `repo/clone_url`), `code.rs` (`search/code` + streaming).
 
 mod blob;
 mod code;
@@ -59,6 +60,9 @@ impl WireError {
                     401 | 403 => "auth",
                     429 => "rate_limited",
                     404 => "not_found",
+                    // Our own 1 MiB preview cap, refused before the
+                    // transfer: adapter policy, not a transport fault.
+                    413 => "provider",
                     _ => "network",
                 };
                 WireError {
@@ -96,6 +100,50 @@ fn w<T>(r: crate::api::ApiResult<T>, f: impl FnOnce(T) -> Value) -> WireResult {
     r.map(f).map_err(|e| WireError::from_api(&e))
 }
 
+/// The `$/partial` channel (protocol v1.3 progressive results): a
+/// request that opted in with `"partial": true` gets its result
+/// streamed as append-only batches keyed by the request id, followed
+/// by a metadata-only reply. Handlers emit through this sink; when the
+/// request did not opt in, `send` is a no-op and the reply carries
+/// everything (unchanged v1.2 behavior).
+pub struct PartialSink<'a> {
+    id: &'a Value,
+    enabled: bool,
+    emit: &'a mut dyn FnMut(String),
+}
+
+impl<'a> PartialSink<'a> {
+    pub fn new(id: &'a Value, params: &Value, emit: &'a mut dyn FnMut(String)) -> Self {
+        PartialSink {
+            id,
+            enabled: params
+                .get("partial")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            emit,
+        }
+    }
+
+    /// True when the request opted into streaming — the reply must
+    /// then be metadata-only (`items: []`, `truncated` authoritative).
+    pub fn wants(&self) -> bool {
+        self.enabled
+    }
+
+    /// Emit one `$/partial` batch for this request's id.
+    fn send(&mut self, items: &[Value]) {
+        if !self.enabled {
+            return;
+        }
+        let note = json!({
+            "jsonrpc": "2.0",
+            "method": "$/partial",
+            "params": { "id": self.id, "items": items },
+        });
+        (self.emit)(note.to_string());
+    }
+}
+
 impl Handler {
     pub fn new(
         instance: &str,
@@ -111,7 +159,12 @@ impl Handler {
         }
     }
 
-    pub fn dispatch(&self, method: &str, params: &Value) -> WireResult {
+    pub fn dispatch(
+        &self,
+        method: &str,
+        params: &Value,
+        partials: &mut PartialSink<'_>,
+    ) -> WireResult {
         match method {
             "initialize" => self.initialize(params),
             "search/repos" => self.search_repos(params["query"].as_str().unwrap_or("")),
@@ -130,7 +183,7 @@ impl Handler {
                 params["is_file"].as_bool().unwrap_or(false),
             ),
             "org/url" => self.org_url(params["org"].as_str().unwrap_or("")),
-            "search/code" => self.search_code(params),
+            "search/code" => self.search_code(params, partials),
             other => Err(WireError {
                 kind: "provider",
                 message: format!("unknown method {other:?}"),

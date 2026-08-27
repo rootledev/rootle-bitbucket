@@ -410,9 +410,12 @@ impl Bitbucket {
     /// Blob bytes at a pinned commit path (sha = "<commit>:<path>").
     pub fn blob(&self, full_name: &str, sha: &str) -> ApiResult<Vec<u8>> {
         let Some((commit, path)) = sha.split_once(':') else {
+            // A sha outside our grammar can never have been served —
+            // that is a missing blob, not a transport failure (the
+            // taxonomy is mapped from the status).
             return Err(ApiError::Api {
-                status: 400,
-                message: format!("malformed content id {sha:?} — expected <commit>:<path>"),
+                status: 404,
+                message: format!("no such blob {sha:?} — content ids are <commit>:<path>"),
                 retry_after: None,
             });
         };
