@@ -121,8 +121,12 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME != crate version v$pkg"; exit 1; }
           # Idempotent: a manual publish (or a re-cut tag) must not
           # abort the release — the GitHub release is still wanted.
-          cargo publish || grep -q "already exists" \
-            && echo "already on crates.io — continuing"
+          # (cargo writes the error to stderr; capture it.)
+          out="$(cargo publish 2>&1)" || {
+            printf '%s\n' "$out"
+            printf '%s' "$out" | grep -q "already exists" \
+              && echo "already on crates.io — continuing" || exit 1
+          }
 
       - name: Create GitHub release
         env:
