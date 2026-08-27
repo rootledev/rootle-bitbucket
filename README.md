@@ -1,5 +1,10 @@
 # rootle-bitbucket
 
+[![ci](https://github.com/rootledev/rootle-bitbucket/actions/workflows/ci.yml/badge.svg)](https://github.com/rootledev/rootle-bitbucket/actions/workflows/ci.yml)
+[![audit](https://github.com/rootledev/rootle-bitbucket/actions/workflows/audit.yml/badge.svg)](https://github.com/rootledev/rootle-bitbucket/actions/workflows/audit.yml)
+[![crates.io](https://img.shields.io/crates/v/rootle-bitbucket.svg)](https://crates.io/crates/rootle-bitbucket)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Bitbucket Cloud provider for [rootle](https://rootle.dev) — browse,
 preview, grep-free search, and clone Bitbucket repos without cloning
 anything first.
