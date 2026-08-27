@@ -58,6 +58,20 @@ or a bearer token alone:
 BITBUCKET_TOKEN=your-api-token
 ```
 
+## Live testing
+
+Fork-scale smoke against the real API (dispatch-only):
+
+```
+gh secret set BITBUCKET_LIVE_USERNAME --repo rootledev/rootle-bitbucket
+gh secret set BITBUCKET_LIVE_TOKEN    --repo rootledev/rootle-bitbucket
+gh workflow run live.yml --repo rootledev/rootle-bitbucket
+```
+
+Same app-password scopes as normal use (Account — Read,
+Repositories — Read). Set `BITBUCKET_LIVE_WORKSPACE` as a repo
+*variable* (not a secret) to exercise a specific workspace.
+
 ## Development
 
 ```

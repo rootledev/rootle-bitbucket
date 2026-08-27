@@ -1,0 +1,54 @@
+name: live
+
+# Live validation vs bitbucket.org: the real adapter against the real
+# API. Dispatch-only — costs quota and needs the BITBUCKET_LIVE_USERNAME
+# + BITBUCKET_LIVE_TOKEN secrets (app password: Account — Read,
+# Repositories — Read) and BITBUCKET_LIVE_WORKSPACE (a workspace you
+# can read; the public-language examples use "rootledev" when present).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build adapter
+        run: cargo build --locked
+
+      - name: Drive the wire surface (initialize → workspaces → repos → tree → blob)
+        env:
+          BITBUCKET_USERNAME: ${{ secrets.BITBUCKET_LIVE_USERNAME }}
+          BITBUCKET_TOKEN: ${{ secrets.BITBUCKET_LIVE_TOKEN }}
+          BITBUCKET_LIVE_WORKSPACE: ${{ vars.BITBUCKET_LIVE_WORKSPACE }}
+        run: |
+          set -e
+          WS="${BITBUCKET_LIVE_WORKSPACE:-rootledev}"
+          REPO="$(printf '%s\n' \
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocol\":1}}" \
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"org/repos\",\"params\":{\"org\":\"$WS\"}}" \
+            | ./target/debug/rootle-bitbucket \
+            | tee /tmp/replies.jsonl \
+            | sed -n '2p' | sed -E 's/.*"repos":\["([^"]+)".*/\1/')"
+          test -n "$REPO" || { echo "no repo listed in $WS"; cat /tmp/replies.jsonl; exit 1; }
+          grep -q '"name":"bitbucket"' /tmp/replies.jsonl
+          echo "protocol surface live: workspace=$WS repo=$REPO"
+
+          # Tree at the branch head, then a blob round trip through a
+          # content id picked from the listing.
+          SHA="$(printf '%s\n' \
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"repo/tree\",\"params\":{\"repo\":\"$WS/$REPO\"}}" \
+            | ./target/debug/rootle-bitbucket \
+            | sed -E 's/.*"entries":.*"sha":"([^"]+)".*/\1/' | head -1)"
+          echo "tree: $WS/$REPO (first sha: ${SHA:0:24}…)"
+          printf '%s\n' \
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"search/code\",\"params\":{\"q\":\"path:src repo:$WS/$REPO\"}}" \
+            | ./target/debug/rootle-bitbucket > /tmp/search.jsonl
+          grep -q '"items"' /tmp/search.jsonl
+          echo "path-only search live: ok"
