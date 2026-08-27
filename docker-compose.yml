@@ -1,0 +1,9 @@
+services:
+  # The gate: fmt + clippy -D warnings + the wiremock suite, in the
+  # container (the host has no toolchain contract).
+  #   docker compose run --build --rm test
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
