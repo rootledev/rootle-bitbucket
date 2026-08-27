@@ -9,6 +9,7 @@
 //! changes — a different commit is a different id).
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 pub const DEFAULT_INSTANCE: &str = "https://api.bitbucket.org";
@@ -116,6 +117,11 @@ struct Paged<T> {
     values: Vec<T>,
     #[serde(default)]
     next: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UserWorkspace {
+    pub workspace: Workspace,
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,9 +270,13 @@ impl Bitbucket {
         Ok((out, false))
     }
 
+    /// A user's workspaces (CHANGE-2770 world: the cross-workspace
+    /// listings are gone; this is the sanctioned replacement). Needs
+    /// the account read scope — tokens scoped to repositories only
+    /// get a 403, and callers fall back to configured workspaces.
     pub fn workspaces(&self) -> ApiResult<Vec<Workspace>> {
-        let (ws, _) = self.paged("/2.0/workspaces?pagelen=100", 200)?;
-        Ok(ws)
+        let (pages, _) = self.paged::<UserWorkspace>("/2.0/user/workspaces?pagelen=100", 200)?;
+        Ok(pages.into_iter().map(|p| p.workspace).collect())
     }
 
     pub fn repo(&self, full_name: &str) -> ApiResult<Repo> {
@@ -282,29 +292,6 @@ impl Bitbucket {
     }
 
     /// A repo's search surface for the launch popup: workspaces whose
-    /// slug or name contains the query, plus repo names inside them.
-    pub fn search(&self, query: &str) -> ApiResult<Vec<(Workspace, Vec<Repo>)>> {
-        let q = query.to_lowercase();
-        let mut out = Vec::new();
-        for ws in self.workspaces()? {
-            let matches = ws.slug.to_lowercase().contains(&q)
-                || ws
-                    .name
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(&q);
-            if matches {
-                let repos = self.workspace_repos(&ws.slug)?;
-                out.push((ws, repos));
-                if out.len() >= 5 {
-                    break;
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// Ref → commit hash (the content-id pin for trees and blobs).
     pub fn branch_head(&self, full_name: &str, branch: &str) -> ApiResult<String> {
         let r: Ref = self.get(&format!(
@@ -330,47 +317,94 @@ impl Bitbucket {
     }
 
     /// Recursive tree by walking directories (Bitbucket lists one
-    /// level per call). Returns protocol tree entries + truncated.
+    /// level per call), eight directories in flight — a sequential
+    /// walk costs one round trip per directory and outruns rootle's
+    /// request deadline on any real repo. Entries are repo-root-
+    /// relative (verified live). Returns protocol entries + truncated.
     pub fn walk_tree(
         &self,
         full_name: &str,
         commit: &str,
     ) -> ApiResult<(Vec<crate::cache::TreeEntry>, bool)> {
-        let mut out: Vec<crate::cache::TreeEntry> = Vec::new();
-        let mut truncated = false;
-        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-        queue.push_back(String::new());
-        while let Some(dir) = queue.pop_front() {
-            for entry in self.src_dir(full_name, commit, &dir)? {
-                if out.len() >= TREE_ENTRY_CAP {
-                    truncated = true;
-                    return Ok((out, truncated));
-                }
-                let path = if dir.is_empty() {
-                    entry.path.clone()
-                } else {
-                    format!("{dir}/{}", entry.path)
-                };
-                if entry.is_dir() {
-                    queue.push_back(path.clone());
-                    out.push(crate::cache::TreeEntry {
-                        path,
-                        is_dir: true,
-                        sha: commit.to_string(),
-                        size: None,
-                    });
-                } else {
-                    out.push(crate::cache::TreeEntry {
-                        path: path.clone(),
-                        is_dir: false,
-                        // Commit-pinned content id (see module docs).
-                        sha: format!("{commit}:{path}"),
-                        size: entry.size,
-                    });
-                }
+        use std::collections::VecDeque;
+        use std::sync::atomic::AtomicBool;
+
+        const WORKERS: usize = 8;
+        let queue: std::sync::Mutex<VecDeque<String>> = std::sync::Mutex::new(VecDeque::new());
+        queue.lock().unwrap().push_back(String::new());
+        let out: std::sync::Mutex<Vec<crate::cache::TreeEntry>> = std::sync::Mutex::new(Vec::new());
+        let truncated = AtomicBool::new(false);
+        let dead: std::sync::Mutex<Option<ApiError>> = std::sync::Mutex::new(None);
+
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                scope.spawn(|| {
+                    loop {
+                        if truncated.load(Ordering::Relaxed) || dead.lock().unwrap().is_some() {
+                            return;
+                        }
+                        // Drain semantics: exit only when the queue is
+                        // empty AND nobody is mid-fetch (their results
+                        // may enqueue more directories) — a plain
+                        // pop-or-return collapses the pool to one
+                        // worker on the first directory.
+                        let dir = {
+                            let mut q = queue.lock().unwrap();
+                            loop {
+                                match q.pop_front() {
+                                    Some(d) => break d,
+                                    None if active.load(Ordering::Relaxed) == 0 => return,
+                                    None => {
+                                        drop(q);
+                                        std::thread::sleep(Duration::from_millis(5));
+                                        q = queue.lock().unwrap();
+                                    }
+                                }
+                            }
+                        };
+                        active.fetch_add(1, Ordering::Relaxed);
+                        match self.src_dir(full_name, commit, &dir) {
+                            Ok(entries) => {
+                                let mut q = queue.lock().unwrap();
+                                let mut o = out.lock().unwrap();
+                                for entry in entries {
+                                    if o.len() >= TREE_ENTRY_CAP {
+                                        truncated.store(true, Ordering::Relaxed);
+                                        return;
+                                    }
+                                    let is_dir = entry.is_dir();
+                                    if is_dir {
+                                        q.push_back(entry.path.clone());
+                                    }
+                                    let sha = if is_dir {
+                                        commit.to_string()
+                                    } else {
+                                        format!("{commit}:{}", entry.path)
+                                    };
+                                    o.push(crate::cache::TreeEntry {
+                                        path: entry.path,
+                                        is_dir,
+                                        sha,
+                                        size: entry.size,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                *dead.lock().unwrap() = Some(e);
+                                return;
+                            }
+                        }
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    }
+                });
             }
+        });
+
+        if let Some(e) = dead.into_inner().unwrap() {
+            return Err(e);
         }
-        Ok((out, truncated))
+        Ok((out.into_inner().unwrap(), truncated.load(Ordering::Relaxed)))
     }
 
     /// Blob bytes at a pinned commit path (sha = "<commit>:<path>").
@@ -382,8 +416,10 @@ impl Bitbucket {
                 retry_after: None,
             });
         };
+        // /src/<commit>/<path> returns the raw bytes for files (the
+        // dedicated /raw/ route no longer exists).
         self.get_bytes(&format!(
-            "/2.0/repositories/{full_name}/raw/{commit}/{path}"
+            "/2.0/repositories/{full_name}/src/{commit}/{path}"
         ))
     }
 }

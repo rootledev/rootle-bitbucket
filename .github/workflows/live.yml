@@ -29,7 +29,7 @@ jobs:
           BITBUCKET_LIVE_WORKSPACE: ${{ vars.BITBUCKET_LIVE_WORKSPACE }}
         run: |
           set -e
-          WS="${BITBUCKET_LIVE_WORKSPACE:-rootledev}"
+          WS="${BITBUCKET_LIVE_WORKSPACE:-pypy}"
           REPO="$(printf '%s\n' \
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocol\":1}}" \
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"org/repos\",\"params\":{\"org\":\"$WS\"}}" \

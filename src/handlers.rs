@@ -4,12 +4,17 @@
 //! code-search API; filename search walks the commit-pinned tree and
 //! serves legal path-only hits.
 
-use crate::api::{ApiError, Bitbucket, Repo};
+use crate::api::{ApiError, ApiResult, Bitbucket, Repo};
 use crate::cache::{Cache, RepoMeta, Tree};
 use serde_json::{Value, json};
 
 pub struct Handler {
     pub bb: Bitbucket,
+    /// Workspaces to serve when discovery can't run (a token scoped
+    /// to repositories only — CHANGE-2770 killed the cross-workspace
+    /// listings, and /user/workspaces wants the account read scope).
+    /// From --workspace flags or BITBUCKET_WORKSPACES.
+    pub workspaces: Vec<String>,
     /// Rooted at the handshake's cache_dir when rootle passes one
     /// (the documented contract); otherwise the XDG default. Interior
     /// mutability because initialize is the first message — &self
@@ -79,10 +84,12 @@ impl Handler {
         token_env: &str,
         username_env: &str,
         cache_base: Option<std::path::PathBuf>,
+        workspaces: Vec<String>,
     ) -> Self {
         Handler {
             bb: Bitbucket::new(instance, token_env, username_env),
             cache: parking_lot::RwLock::new(Cache::new(cache_base)),
+            workspaces,
         }
     }
 
@@ -148,11 +155,49 @@ impl Handler {
         }))
     }
 
+    fn search(&self, query: &str) -> ApiResult<Vec<(String, Vec<Repo>)>> {
+        let q = query.to_lowercase();
+        // Configured workspaces are served directly (a token scoped to
+        // repositories only can't discover — CHANGE-2770); otherwise
+        // /user/workspaces, which wants the account read scope.
+        let slugs: Vec<String> = if !self.workspaces.is_empty() {
+            self.workspaces
+                .iter()
+                .filter(|s| s.to_lowercase().contains(&q))
+                .cloned()
+                .collect()
+        } else {
+            self.bb
+                .workspaces()?
+                .into_iter()
+                .filter(|ws| {
+                    ws.slug.to_lowercase().contains(&q)
+                        || ws
+                            .name
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&q)
+                })
+                .map(|ws| ws.slug)
+                .collect()
+        };
+        let mut out = Vec::new();
+        for slug in slugs {
+            let repos = self.bb.workspace_repos(&slug)?;
+            out.push((slug, repos));
+            if out.len() >= 5 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     fn search_repos(&self, query: &str) -> WireResult {
-        w(self.bb.search(query), |groups| {
+        w(self.search(query), |groups| {
             let mut items = Vec::new();
             for (ws, repos) in &groups {
-                items.push(json!({ "org": ws.slug }));
+                items.push(json!({ "org": ws }));
                 for repo in repos.iter().take(10) {
                     items.push(json!({ "full_name": repo.full_name }));
                 }
@@ -433,7 +478,13 @@ mod tests {
 
     #[test]
     fn content_grep_without_scope_errors_honestly() {
-        let h = Handler::new("http://unused.invalid", "NOPE_TOKEN", "NOPE_USER", None);
+        let h = Handler::new(
+            "http://unused.invalid",
+            "NOPE_TOKEN",
+            "NOPE_USER",
+            None,
+            Vec::new(),
+        );
         let err = h.search_code(&json!({ "q": "render" })).unwrap_err();
         assert_eq!(err.kind, "provider");
         assert!(err.message.contains("no code-search API"));

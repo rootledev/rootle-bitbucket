@@ -28,7 +28,7 @@ fn reply(uri: &str, method: &str, params: Value) -> Value {
     let cache = temp_cache();
     let out = std::thread::scope(|s| {
         s.spawn(move || {
-            let h = Handler::new(uri, "TEST_TOKEN", "TEST_USER", Some(cache));
+            let h = Handler::new(uri, "TEST_TOKEN", "TEST_USER", Some(cache), Vec::new());
             respond(&h, &line).unwrap()
         })
         .join()
@@ -61,7 +61,7 @@ fn error_with_env(
     let cache = temp_cache();
     let out = std::thread::scope(|s| {
         s.spawn(move || {
-            let h = Handler::new(uri, token_env, user_env, Some(cache));
+            let h = Handler::new(uri, token_env, user_env, Some(cache), Vec::new());
             respond(&h, &line).unwrap()
         })
         .join()
@@ -148,18 +148,18 @@ async fn tree_walk_recurses_directories_and_pins_content_ids() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "values": [
                 { "type": "commit_directory", "path": "src" },
-                { "type": "file", "path": "README.md", "size": 12 }
+                { "type": "commit_file", "path": "README.md", "size": 12 }
             ]
         })))
         .mount(&server)
         .await;
-    // Entries are RELATIVE to the listed directory (Bitbucket's
-    // shape): listing /src/abc123/src/ returns "main.rs".
+    // Entries are repo-root-relative (verified live): listing
+    // /src/abc123/src/ returns "src/main.rs".
     Mock::given(method("GET"))
         .and(path("/2.0/repositories/team/alpha/src/abc123/src/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "values": [
-                { "type": "file", "path": "main.rs", "size": 40 }
+                { "type": "commit_file", "path": "src/main.rs", "size": 40 }
             ]
         })))
         .mount(&server)
@@ -203,8 +203,8 @@ async fn path_search_serves_path_only_hits() {
         .and(path("/2.0/repositories/team/alpha/src/deadbeef/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "values": [
-                { "type": "file", "path": "parser.rs" },
-                { "type": "file", "path": "main.rs" }
+                { "type": "commit_file", "path": "parser.rs" },
+                { "type": "commit_file", "path": "main.rs" }
             ]
         })))
         .mount(&server)
@@ -278,7 +278,7 @@ async fn blob_round_trips_through_the_content_id() {
     set_creds();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/2.0/repositories/team/alpha/raw/abc123/src/main.rs"))
+        .and(path("/2.0/repositories/team/alpha/src/abc123/src/main.rs"))
         .respond_with(ResponseTemplate::new(200).set_body_string("fn main() {}"))
         .mount(&server)
         .await;
