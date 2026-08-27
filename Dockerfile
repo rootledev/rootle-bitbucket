@@ -7,7 +7,6 @@ RUN apk add --no-cache musl-dev \
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY tests ./tests
 
 FROM builder AS test
 RUN cargo fmt --check \
