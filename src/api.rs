@@ -24,6 +24,10 @@ pub const BLOB_CAP: usize = 1024 * 1024;
 /// reports `truncated: true`.
 pub const TREE_ENTRY_CAP: usize = 25_000;
 
+/// Page size for the commits listing (the endpoint's own maximum) —
+/// `repo/log` aggregates pages up to the caller's limit.
+const COMMITS_PAGELEN: usize = 100;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("{message}")]
@@ -141,6 +145,46 @@ pub struct RefTarget {
     pub hash: String,
 }
 
+/// A branch or tag listing entry (`repo/refs`, v1.5). The default
+/// marker rides the repo entity's mainbranch, not this listing.
+#[derive(Debug, Deserialize)]
+pub struct NamedRef {
+    pub name: String,
+    pub target: RefTarget,
+}
+
+/// One commit of the history listing (`repo/log`, v1.5). Author and
+/// date are null-tolerant (service commits can lack an author); the
+/// date is ISO-8601 as the forge reports it — rootle's history lens
+/// takes it verbatim.
+#[derive(Debug, Deserialize)]
+pub struct Commit {
+    pub hash: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub author: Option<CommitAuthor>,
+    #[serde(default)]
+    pub date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitAuthor {
+    /// "Name <email>" as the forge reports the author.
+    pub raw: String,
+}
+
+impl Commit {
+    /// The subject line (one line per history item).
+    pub fn subject(&self) -> String {
+        self.message.lines().next().unwrap_or("").to_string()
+    }
+
+    pub fn author_raw(&self) -> &str {
+        self.author.as_ref().map(|a| a.raw.as_str()).unwrap_or("")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SrcEntry {
     #[serde(rename = "type")]
@@ -251,7 +295,10 @@ impl Bitbucket {
 
     /// Aggregate every page of a paginated collection, up to `cap`
     /// values (past it: stop and report truncation via the flag the
-    /// caller reads from the returned count).
+    /// caller reads from the returned count). Truncated means
+    /// provably incomplete: the backend signalled more (`next`), or
+    /// a single page overflowed the cap — a page landing exactly on
+    /// the cap with no `next` is complete history.
     fn paged<T>(&self, first: &str, cap: usize) -> ApiResult<(Vec<T>, bool)>
     where
         T: for<'de> Deserialize<'de>,
@@ -260,12 +307,13 @@ impl Bitbucket {
         let mut next = Some(first.to_string());
         while let Some(url) = next.take() {
             let page: Paged<T> = self.get(&url)?;
-            next = page.next;
             out.extend(page.values);
             if out.len() >= cap {
+                let truncated = page.next.is_some() || out.len() > cap;
                 out.truncate(cap);
-                return Ok((out, true));
+                return Ok((out, truncated));
             }
+            next = page.next;
         }
         Ok((out, false))
     }
@@ -298,6 +346,75 @@ impl Bitbucket {
             "/2.0/repositories/{full_name}/refs/branches/{branch}"
         ))?;
         Ok(r.target.hash)
+    }
+
+    /// Branches with their heads (`repo/refs`, v1.5). The 500-ref
+    /// budget mirrors the repo listing cap — enough for real repos,
+    /// bounded for the request deadline.
+    pub fn branches(&self, full_name: &str) -> ApiResult<Vec<NamedRef>> {
+        let (refs, _) = self.paged(
+            &format!("/2.0/repositories/{full_name}/refs/branches?pagelen=100"),
+            500,
+        )?;
+        Ok(refs)
+    }
+
+    /// Tags with the commits they mark (`repo/refs`, v1.5) — a tag's
+    /// target hash IS the commit it was created at.
+    pub fn tags(&self, full_name: &str) -> ApiResult<Vec<NamedRef>> {
+        let (refs, _) = self.paged(
+            &format!("/2.0/repositories/{full_name}/refs/tags?pagelen=100"),
+            500,
+        )?;
+        Ok(refs)
+    }
+
+    /// Resolve a user-facing revision — branch, tag, or commit sha —
+    /// to the commit hash every content id pins to (v1.5). A
+    /// well-formed sha is taken at face value (the pinned fetch 404s
+    /// if it doesn't exist — shas arrive from our own listings and
+    /// no forge survives a 40-hex branch name); otherwise branch,
+    /// then tag; anything else is a not_found naming the ref.
+    pub fn resolve_ref(&self, full_name: &str, ref_: &str) -> ApiResult<String> {
+        if looks_like_commit_sha(ref_) {
+            return Ok(ref_.to_string());
+        }
+        for kind in ["branches", "tags"] {
+            match self.get::<Ref>(&format!("/2.0/repositories/{full_name}/refs/{kind}/{ref_}")) {
+                Ok(r) => return Ok(r.target.hash),
+                // Not this kind of ref — try the next.
+                Err(ApiError::Api { status: 404, .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(ApiError::Api {
+            status: 404,
+            message: format!("unknown ref {ref_:?} in {full_name}"),
+            retry_after: None,
+        })
+    }
+
+    /// Commit history at an include point, optionally filtered to a
+    /// path, newest first (`repo/log`, v1.5). `include` is a commit
+    /// hash — the handler resolves refs first so unknown refs are a
+    /// clean not_found. The cap rides the bounded-compute contract:
+    /// stop at ~limit, report truncation past it.
+    pub fn commits(
+        &self,
+        full_name: &str,
+        include: &str,
+        path: Option<&str>,
+        limit: usize,
+    ) -> ApiResult<(Vec<Commit>, bool)> {
+        let mut first = format!(
+            "/2.0/repositories/{full_name}/commits?include={include}&pagelen={}",
+            limit.min(COMMITS_PAGELEN)
+        );
+        if let Some(p) = path.filter(|p| !p.is_empty()) {
+            first.push_str("&path=");
+            first.push_str(&encode_query(p));
+        }
+        self.paged(&first, limit)
     }
 
     /// One directory listing at a pinned commit.
@@ -429,6 +546,27 @@ impl Bitbucket {
 
 fn classify_send(e: reqwest::Error) -> ApiError {
     ApiError::Network(e.to_string())
+}
+
+/// A git commit sha as this forge shapes them: 40 hex (sha1) or 64
+/// hex (sha256 repos).
+fn looks_like_commit_sha(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Percent-encode a query-param value (unreserved plus `/` and `.`
+/// stay literal — paths read better in logs, servers decode alike).
+fn encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn classify_status(resp: reqwest::blocking::Response) -> ApiResult<reqwest::blocking::Response> {

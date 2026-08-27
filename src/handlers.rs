@@ -1,21 +1,30 @@
 //! Protocol dispatch: one method per arm, the wire shapes from
-//! doc/provider-protocol.md (v1.3). Capabilities declare the split:
+//! doc/provider-protocol.md (v1.5). Capabilities declare the split:
 //! `code_search: false, file_search: true` — Bitbucket Cloud has no
 //! code-search index; queries are answered by walking the
 //! commit-pinned tree (path/extension terms as path-only hits, bare
-//! terms by grepping the fetched blobs).
+//! terms by grepping the fetched blobs). Revision awareness (v1.5):
+//! `refs: true, log: true` — and `blame: false`, the honest answer
+//! (Bitbucket Cloud has no blame API); dispatch has no `repo/blame`
+//! arm, so the call fails as an unknown method instead of a stub
+//! that fake-succeeds.
 //!
 //! Layout: this file is the surface — handler state, dispatch, the
 //! $/partial plumbing, and the wire error taxonomy. The method bodies
 //! live in sibling submodules by protocol concern: `initialize.rs`
 //! (handshake + cache re-rooting), `search.rs` (`search/repos`,
-//! `org/repos`), `tree.rs` (branch → commit walk + revalidation),
-//! `blob.rs` (`repo/blob`), `urls.rs` (`repo/web_url`, `org/url`,
-//! `repo/clone_url`), `code.rs` (`search/code` + streaming).
+//! `org/repos`), `tree.rs` (branch → commit walk + revalidation, and
+//! the v1.5 ref → commit resolution every revision method shares),
+//! `refs.rs` (`repo/refs`), `log.rs` (`repo/log`), `blob.rs`
+//! (`repo/blob`, `repo/blob_at`), `urls.rs` (`repo/web_url`,
+//! `org/url`, `repo/clone_url`), `code.rs` (`search/code` +
+//! streaming).
 
 mod blob;
 mod code;
 mod initialize;
+mod log;
+mod refs;
 mod search;
 mod tree;
 mod urls;
@@ -169,10 +178,28 @@ impl Handler {
             "initialize" => self.initialize(params),
             "search/repos" => self.search_repos(params["query"].as_str().unwrap_or("")),
             "org/repos" => self.org_repos(params["org"].as_str().unwrap_or("")),
-            "repo/tree" => self.repo_tree(params["repo"].as_str().unwrap_or("")),
+            "repo/tree" => self.repo_tree(
+                params["repo"].as_str().unwrap_or(""),
+                params["ref"].as_str(),
+            ),
             "repo/blob" => self.repo_blob(
                 params["repo"].as_str().unwrap_or(""),
                 params["sha"].as_str().unwrap_or(""),
+            ),
+            // v1.5 revisions: refs, log, blob_at. `repo/blame` is
+            // deliberately absent — capability false; the unknown-
+            // method error below is the honest reply.
+            "repo/refs" => self.repo_refs(params["repo"].as_str().unwrap_or("")),
+            "repo/log" => self.repo_log(
+                params["repo"].as_str().unwrap_or(""),
+                params["path"].as_str(),
+                params["ref"].as_str(),
+                params["limit"].as_u64(),
+            ),
+            "repo/blob_at" => self.repo_blob_at(
+                params["repo"].as_str().unwrap_or(""),
+                params["path"].as_str().unwrap_or(""),
+                params["ref"].as_str(),
             ),
             "repo/clone_url" => self.repo_clone_url(params["repo"].as_str().unwrap_or("")),
             "repo/web_url" => self.repo_web_url(

@@ -33,7 +33,14 @@ impl Handler {
             "capabilities": {
                 "orgs": true,
                 "code_search": false,
-                "file_search": true
+                "file_search": true,
+                // Revision awareness (v1.5): branch/tag listings and
+                // commit history are served; blame is not —
+                // Bitbucket Cloud has no blame API, and false is the
+                // honest answer (the UI hides the lens).
+                "refs": true,
+                "log": true,
+                "blame": false
             }
         }))
     }
@@ -55,5 +62,10 @@ mod tests {
         assert_eq!(r["capabilities"]["code_search"], false);
         assert_eq!(r["capabilities"]["file_search"], true);
         assert_eq!(r["capabilities"]["orgs"], true);
+        // v1.5 revision trio: refs and log served, blame honestly
+        // absent (no Bitbucket Cloud blame API).
+        assert_eq!(r["capabilities"]["refs"], true);
+        assert_eq!(r["capabilities"]["log"], true);
+        assert_eq!(r["capabilities"]["blame"], false);
     }
 }
