@@ -24,7 +24,10 @@ jobs:
 
       - name: Drive the wire surface (initialize → workspaces → repos → tree → blob)
         env:
-          BITBUCKET_USERNAME: ${{ secrets.BITBUCKET_LIVE_USERNAME }}
+          # Bearer only: an Atlassian API token with a username would
+          # ride as Basic and Bitbucket rejects that pairing ("API
+          # token must be used with an atlassian registered email").
+          # App-password credentials would set both.
           BITBUCKET_TOKEN: ${{ secrets.BITBUCKET_LIVE_TOKEN }}
           BITBUCKET_LIVE_WORKSPACE: ${{ vars.BITBUCKET_LIVE_WORKSPACE }}
         run: |
@@ -36,7 +39,11 @@ jobs:
             | ./target/debug/rootle-bitbucket \
             | tee /tmp/replies.jsonl \
             | sed -n '2p' | sed -E 's/.*"repos":\["([^"]+)".*/\1/')"
-          test -n "$REPO" || { echo "no repo listed in $WS"; cat /tmp/replies.jsonl; exit 1; }
+          echo "REPO=$REPO" >&2
+          printf '%s' "$REPO" | grep -Eq '^[a-zA-Z0-9._-]+$' || {
+            echo "no repo listed in $WS (got: $REPO)"; cat /tmp/replies.jsonl; exit 1
+          }
+          ! grep -q '"error"' /tmp/replies.jsonl || { cat /tmp/replies.jsonl; exit 1; }
           grep -q '"name":"bitbucket"' /tmp/replies.jsonl
           echo "protocol surface live: workspace=$WS repo=$REPO"
 
