@@ -43,7 +43,62 @@ impl Handler {
         Ok((meta.branch, tree))
     }
 
-    fn revalidate_repo(&self, full_name: &str) -> crate::api::ApiResult<RepoMeta> {
+    /// Default-branch head commit (repo meta, lazily revalidated) —
+    /// what revision methods pin to when no ref was sent.
+    pub(super) fn head_commit(&self, full_name: &str) -> crate::api::ApiResult<String> {
+        // Two statements, deliberately: the read guard is a temporary
+        // that must drop before revalidate takes the write lock
+        // (parking_lot deadlocks otherwise).
+        let cached = self.cache.read().repo_meta(full_name);
+        let meta = cached.or_else(|| self.revalidate_repo(full_name).ok());
+        let Some(meta) = meta else {
+            return Err(ApiError::Api {
+                status: 404,
+                message: format!("no such repo {full_name:?}"),
+                retry_after: None,
+            });
+        };
+        self.bb.branch_head(full_name, &meta.branch)
+    }
+
+    /// Ref → commit, shared by every revision method (tree, log,
+    /// blob_at). No ref means the default branch's head.
+    pub(super) fn resolve_commit(
+        &self,
+        full_name: &str,
+        ref_: Option<&str>,
+    ) -> crate::api::ApiResult<String> {
+        match ref_ {
+            None => self.head_commit(full_name),
+            Some(r) => self.bb.resolve_ref(full_name, r),
+        }
+    }
+
+    /// Tree pinned to an explicit ref (v1.5): branch, tag, or sha,
+    /// resolved fresh every call (a branch head moves; tags and shas
+    /// are immutable), then the same commit-keyed cache + walk. The
+    /// reply names the ref that was served.
+    pub(super) fn tree_at_ref(
+        &self,
+        full_name: &str,
+        ref_: &str,
+    ) -> crate::api::ApiResult<(String, Tree)> {
+        let commit = self.bb.resolve_ref(full_name, ref_)?;
+        let key = commit_key(&commit);
+        if let Some(tree) = self.cache.read().tree(full_name, &key) {
+            return Ok((ref_.to_string(), tree));
+        }
+        let (entries, truncated) = self.bb.walk_tree(full_name, &commit)?;
+        let tree = Tree {
+            entries,
+            truncated,
+            branch: ref_.to_string(),
+        };
+        self.cache.write().store_tree(full_name, &key, &tree);
+        Ok((ref_.to_string(), tree))
+    }
+
+    pub(super) fn revalidate_repo(&self, full_name: &str) -> crate::api::ApiResult<RepoMeta> {
         let repo: Repo = self.bb.repo(full_name)?;
         let meta = RepoMeta {
             full_name: repo.full_name.clone(),
@@ -53,22 +108,29 @@ impl Handler {
         Ok(meta)
     }
 
-    pub(super) fn repo_tree(&self, full_name: &str) -> WireResult {
-        // A 404 on a cached repo means it moved — revalidate once.
-        let result = self.tree_at_commit(full_name);
-        let (branch, tree) = match result {
-            Ok(v) => v,
-            Err(ApiError::Api { status: 404, .. }) => {
-                self.cache.write().drop_repo_meta(full_name);
-                let repo = self.bb.repo(full_name)?;
-                let meta = RepoMeta {
-                    full_name: repo.full_name.clone(),
-                    branch: repo.branch(),
-                };
-                self.cache.write().store_repo_meta(&meta);
-                self.tree_at_commit(full_name)?
+    pub(super) fn repo_tree(&self, full_name: &str, ref_: Option<&str>) -> WireResult {
+        let (branch, tree) = match ref_ {
+            // A pinned revision skips the revalidation dance: the ref
+            // resolves fresh every call, and an unknown ref or repo
+            // lands as the plain not_found the protocol asks for.
+            Some(r) => self.tree_at_ref(full_name, r)?,
+            None => {
+                // A 404 on a cached repo means it moved — revalidate once.
+                match self.tree_at_commit(full_name) {
+                    Ok(v) => v,
+                    Err(ApiError::Api { status: 404, .. }) => {
+                        self.cache.write().drop_repo_meta(full_name);
+                        let repo = self.bb.repo(full_name)?;
+                        let meta = RepoMeta {
+                            full_name: repo.full_name.clone(),
+                            branch: repo.branch(),
+                        };
+                        self.cache.write().store_repo_meta(&meta);
+                        self.tree_at_commit(full_name)?
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
-            Err(e) => return Err(e.into()),
         };
         Ok(json!({
             "entries": tree
@@ -92,7 +154,7 @@ fn commit_key(commit: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::handlers::tests::{result, results, set_creds};
+    use crate::handlers::tests::{error, result, results, set_creds};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -206,5 +268,116 @@ mod tests {
             out[1]["result"]["entries"][0]["sha"], "gen2:lib.rs",
             "a moved head must move the content ids, not replay the cached tree"
         );
+    }
+
+    #[tokio::test]
+    async fn tree_at_a_branch_ref_walks_that_branches_head() {
+        set_creds();
+        let server = MockServer::start().await;
+        // The default branch is NOT requested: an explicit ref pins
+        // the walk without the repo-meta round trip.
+        Mock::given(method("GET"))
+            .and(path("/2.0/repositories/team/alpha/refs/branches/feature-x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "target": { "hash": "feed42" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2.0/repositories/team/alpha/src/feed42/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "values": [ { "type": "commit_file", "path": "lib.rs", "size": 3 } ]
+            })))
+            .mount(&server)
+            .await;
+        let r = result(
+            &server.uri(),
+            "repo/tree",
+            json!({ "repo": "team/alpha", "ref": "feature-x" }),
+        );
+        // The reply names what was actually served (v1.5).
+        assert_eq!(r["branch"], "feature-x");
+        assert_eq!(r["entries"][0]["sha"], "feed42:lib.rs");
+    }
+
+    #[tokio::test]
+    async fn tree_at_a_tag_ref_resolves_to_the_tagged_commit() {
+        set_creds();
+        let server = MockServer::start().await;
+        // Not a branch: the probe 404s and the tag listing answers.
+        Mock::given(method("GET"))
+            .and(path("/2.0/repositories/team/alpha/refs/branches/v1.0"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2.0/repositories/team/alpha/refs/tags/v1.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "target": { "hash": "tagged9" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2.0/repositories/team/alpha/src/tagged9/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "values": [ { "type": "commit_file", "path": "lib.rs", "size": 3 } ]
+            })))
+            .mount(&server)
+            .await;
+        let r = result(
+            &server.uri(),
+            "repo/tree",
+            json!({ "repo": "team/alpha", "ref": "v1.0" }),
+        );
+        assert_eq!(r["branch"], "v1.0");
+        assert_eq!(r["entries"][0]["sha"], "tagged9:lib.rs");
+    }
+
+    #[tokio::test]
+    async fn tree_at_a_commit_sha_skips_the_probes() {
+        set_creds();
+        let server = MockServer::start().await;
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        // Only the pinned walk is requested — a well-formed sha is
+        // taken at face value (no branch/tag probes; the walk 404s
+        // if the sha doesn't exist).
+        Mock::given(method("GET"))
+            .and(path(format!("/2.0/repositories/team/alpha/src/{sha}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "values": [ { "type": "commit_file", "path": "lib.rs", "size": 3 } ]
+            })))
+            .mount(&server)
+            .await;
+        let r = result(
+            &server.uri(),
+            "repo/tree",
+            json!({ "repo": "team/alpha", "ref": sha }),
+        );
+        assert_eq!(r["branch"], sha);
+        assert_eq!(r["entries"][0]["sha"], format!("{sha}:lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_ref_is_not_found() {
+        set_creds();
+        let server = MockServer::start().await;
+        for p in [
+            "/2.0/repositories/team/alpha/refs/branches/nope",
+            "/2.0/repositories/team/alpha/refs/tags/nope",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+        }
+        let e = error(
+            &server.uri(),
+            "repo/tree",
+            json!({ "repo": "team/alpha", "ref": "nope" }),
+        );
+        assert_eq!(e["data"]["kind"], "not_found");
+        let msg = e["message"].as_str().unwrap();
+        assert!(msg.contains("nope"), "message names the ref: {msg}");
     }
 }

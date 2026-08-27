@@ -169,3 +169,20 @@ fn the_preview_cap_is_provider_policy_not_a_transport_fault() {
     });
     assert_eq!(e.kind, "provider");
 }
+
+#[tokio::test]
+async fn blame_is_the_honest_unknown_method() {
+    // Bitbucket Cloud has no blame API: the handshake says
+    // blame:false and dispatch has no repo/blame arm. The
+    // unknown-method error is the correct reply — a stub that
+    // fake-succeeds would lie to the history lens.
+    let server = MockServer::start().await;
+    let e = error(
+        &server.uri(),
+        "repo/blame",
+        json!({ "repo": "team/alpha", "path": "lib.rs" }),
+    );
+    assert_eq!(e["data"]["kind"], "provider");
+    let msg = e["message"].as_str().unwrap();
+    assert!(msg.contains("repo/blame"), "names the method: {msg}");
+}

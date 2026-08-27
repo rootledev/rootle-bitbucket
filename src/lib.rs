@@ -13,6 +13,12 @@
 //! bare terms grep the fetched blobs (binary-skipping, line-anchored,
 //! bounded) — no index, just the tree.
 //!
+//! Revision awareness (protocol v1.5): `refs` and `log` are served
+//! (branch/tag listings, commit history at any branch, tag, or sha —
+//! every content id pinned to the resolved commit); `blame` is
+//! declared false — Bitbucket Cloud has no blame API, and the
+//! unknown-method error is the honest reply.
+//!
 //! Process-shape obligations (restart obligations): startup is cheap
 //! and idempotent — no network, no token read; rootle may kill and
 //! respawn this process an unbounded number of times per session.
