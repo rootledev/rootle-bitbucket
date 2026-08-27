@@ -119,7 +119,10 @@ jobs:
           pkg="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           test "v$pkg" = "$GITHUB_REF_NAME" || {
             echo "::error::tag $GITHUB_REF_NAME != crate version v$pkg"; exit 1; }
-          cargo publish
+          # Idempotent: a manual publish (or a re-cut tag) must not
+          # abort the release — the GitHub release is still wanted.
+          cargo publish || grep -q "already exists" \
+            && echo "already on crates.io — continuing"
 
       - name: Create GitHub release
         env:
