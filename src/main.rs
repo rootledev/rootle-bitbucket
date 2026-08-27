@@ -51,10 +51,10 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(reply) = respond(&handler, &line) {
+        respond(&handler, &line, &mut |reply| {
             println!("{reply}");
             use std::io::Write;
             let _ = out.flush();
-        }
+        });
     }
 }

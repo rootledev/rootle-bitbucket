@@ -1,13 +1,14 @@
 # rootle-bitbucket
 
 [![ci](https://github.com/rootledev/rootle-bitbucket/actions/workflows/ci.yml/badge.svg)](https://github.com/rootledev/rootle-bitbucket/actions/workflows/ci.yml)
+[![conformance](https://github.com/rootledev/rootle-bitbucket/actions/workflows/conformance.yml/badge.svg)](https://github.com/rootledev/rootle-bitbucket/actions/workflows/conformance.yml)
 [![audit](https://github.com/rootledev/rootle-bitbucket/actions/workflows/audit.yml/badge.svg)](https://github.com/rootledev/rootle-bitbucket/actions/workflows/audit.yml)
-[![crates.io](https://img.shields.io/crates/v/rootle-bitbucket.svg)](https://crates.io/crates/rootle-bitbucket)
+[![crates.io](https://img.shields.io/crates/v/rootle-bitbucket.svg)](https://crates.io/crates.io/rootle-bitbucket)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Bitbucket Cloud provider for [rootle](https://rootle.dev) — browse,
-preview, grep-free search, and clone Bitbucket repos without cloning
-anything first.
+preview, search, and clone Bitbucket repos without cloning anything
+first.
 
 Speaks the [rootle stdio provider protocol](https://github.com/rootledev/rootle/blob/main/doc/provider-protocol.md)
 (v1.3) over Bitbucket Cloud's REST 2.0 API. Shares no code with
@@ -23,8 +24,13 @@ Bitbucket Cloud has **no code-search API** — the handshake declares
 - **Preview**: syntax-highlighted blobs, pinned to commit hashes
   (Bitbucket exposes no git object ids, so `<commit>:<path>` is the
   content id).
-- **File find**: `path:`-scoped search over the cached tree, served as
-  path-only hits. Content grep answers with an honest error.
+- **File find**: `path:`/`extension:` search over the cached tree,
+  served as path-only hits.
+- **Grep**: bare terms grep the fetched blobs through the same cache
+  the preview reads — binary-skipping, line-anchored, capped (no
+  index, just the tree; `code_search: false` stays — this is bounded
+  best-effort, not a global index). `search/code` streams per-repo
+  `$/partial` batches when rootle asks (`partial: true`, v1.3).
 - **Clone**: the wizard uses the repo's https clone URL.
 - **Yank**: browser URLs with `#lines-N` fragments.
 
@@ -77,10 +83,25 @@ Same app-password scopes as normal use (Account — Read,
 Repositories — Read). Set `BITBUCKET_LIVE_WORKSPACE` as a repo
 *variable* (not a secret) to exercise a specific workspace.
 
+## Conformance
+
+[forge-conformance](https://github.com/rootledev/forge-conformance)
+(rootledev/rootle plans/0015) — the canonical 37-case protocol suite —
+runs against this adapter on every push. The harness is
+`examples/forge_conformance`: the real adapter serving the canonical
+fixture through an in-process Bitbucket mock. Locally:
+
+```
+cargo build --locked --example forge_conformance
+git clone https://github.com/rootledev/forge-conformance /tmp/fc
+cd /tmp/fc && PROVIDER=../rootle-bitbucket/target/debug/examples/forge_conformance python3 run
+```
+
 ## Development
 
 ```
 docker compose run --build --rm test   # fmt + clippy + wiremock suite
 ```
+
 
 MIT.

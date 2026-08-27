@@ -1,0 +1,44 @@
+name: conformance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The canonical protocol suite (rootledev/forge-conformance, plans
+  # 0015): 37 cases against THIS adapter serving the canonical
+  # fixture. The harness is examples/forge_conformance — the real
+  # adapter pointed at an in-process Bitbucket Cloud mock backed by
+  # the materialized fixture copy (see its doc comment).
+  forge-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the conformance suite
+        uses: actions/checkout@v7
+        with:
+          repository: rootledev/forge-conformance
+          path: forge
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the fixture-backed harness
+        run: cargo build --locked --example forge_conformance
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install pytest
+        run: python -m pip install pytest
+
+      - name: Suite vs the adapter (37 cases)
+        working-directory: forge
+        run: python3 run -- ../target/debug/examples/forge_conformance

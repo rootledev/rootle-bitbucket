@@ -7,8 +7,14 @@ use crate::cache::{RepoMeta, Tree};
 use serde_json::json;
 
 impl Handler {
-    /// Branch → commit, then the walk (cache-first: a commit-pinned
-    /// tree is immutable).
+    /// Branch → commit → tree. The head is resolved on every call: a
+    /// branch-keyed cache entry would serve the tree as of first
+    /// fetch forever, and content ids must move when the backend's
+    /// content moves (a pushed commit is a new id set — rootle's
+    /// cache is content-keyed and never invalidates). Only the
+    /// commit-keyed tree cache is safe to serve blind, because a
+    /// commit-pinned tree is immutable; the ref round trip is the
+    /// price of freshness.
     pub(super) fn tree_at_commit(&self, full_name: &str) -> crate::api::ApiResult<(String, Tree)> {
         // Two statements, deliberately: the read guard is a temporary
         // that must drop before revalidate takes the write lock
@@ -22,17 +28,9 @@ impl Handler {
                 retry_after: None,
             });
         };
-        if let Some(tree) = self.cache.read().tree(full_name, &branch_key(&meta)) {
-            return Ok((meta.branch, tree));
-        }
         let commit = self.bb.branch_head(full_name, &meta.branch)?;
         let key = commit_key(&commit);
         if let Some(tree) = self.cache.read().tree(full_name, &key) {
-            // Remember the head mapping so the next cold start skips
-            // the ref round trip.
-            self.cache
-                .write()
-                .store_tree(full_name, &branch_key(&meta), &tree);
             return Ok((meta.branch, tree));
         }
         let (entries, truncated) = self.bb.walk_tree(full_name, &commit)?;
@@ -42,9 +40,6 @@ impl Handler {
             branch: meta.branch.clone(),
         };
         self.cache.write().store_tree(full_name, &key, &tree);
-        self.cache
-            .write()
-            .store_tree(full_name, &branch_key(&meta), &tree);
         Ok((meta.branch, tree))
     }
 
@@ -91,20 +86,13 @@ impl Handler {
         }))
     }
 }
-
-/// Cache key for the branch→head mapping (trees fetched via a branch
-/// name are the head at fetch time; the commit key holds the truth).
-fn branch_key(meta: &RepoMeta) -> String {
-    format!("branch-{}", meta.branch)
-}
-
 fn commit_key(commit: &str) -> String {
     commit.to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::handlers::tests::{result, set_creds};
+    use crate::handlers::tests::{result, results, set_creds};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -163,5 +151,60 @@ mod tests {
         let main = entries.iter().find(|e| e["path"] == "src/main.rs").unwrap();
         assert_eq!(main["sha"], "abc123:src/main.rs");
         assert_eq!(main["type"], "blob");
+    }
+
+    #[tokio::test]
+    async fn content_ids_move_when_the_head_moves() {
+        // A branch-keyed cache would serve the first-fetched tree
+        // forever; content ids must track the backend's head (a
+        // pushed commit is a new id set — rootle's cache is
+        // content-keyed and never invalidates).
+        set_creds();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/2.0/repositories/team/alpha"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "full_name": "team/alpha", "mainbranch": { "name": "main" }
+            })))
+            .mount(&server)
+            .await;
+        // Head gen 1 answers once, then gen 2 takes over.
+        Mock::given(method("GET"))
+            .and(path("/2.0/repositories/team/alpha/refs/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "target": { "hash": "gen1" }
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2.0/repositories/team/alpha/refs/branches/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "target": { "hash": "gen2" }
+            })))
+            .mount(&server)
+            .await;
+        for commit in ["gen1", "gen2"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/2.0/repositories/team/alpha/src/{commit}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "values": [ { "type": "commit_file", "path": "lib.rs", "size": 3 } ]
+                })))
+                .mount(&server)
+                .await;
+        }
+        let out = results(
+            &server.uri(),
+            "repo/tree",
+            &[
+                json!({ "repo": "team/alpha" }),
+                json!({ "repo": "team/alpha" }),
+            ],
+        );
+        assert_eq!(out[0]["result"]["entries"][0]["sha"], "gen1:lib.rs");
+        assert_eq!(
+            out[1]["result"]["entries"][0]["sha"], "gen2:lib.rs",
+            "a moved head must move the content ids, not replay the cached tree"
+        );
     }
 }
