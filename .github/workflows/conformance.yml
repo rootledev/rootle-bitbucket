@@ -8,20 +8,22 @@ on:
 
 jobs:
   # The canonical protocol suite (rootledev/forge-conformance, plans
-  # 0015): 47 cases against THIS adapter serving the canonical
-  # fixture. The harness is examples/forge_conformance — the real
-  # adapter pointed at an in-process Bitbucket Cloud mock backed by
-  # the materialized fixture copy (plain repos + the suite's git-built
-  # revision repo; see its doc comment).
+  # 0015) against THIS adapter serving the canonical fixture. The
+  # harness is examples/forge_conformance — the real adapter pointed
+  # at an in-process Bitbucket Cloud mock backed by the materialized
+  # fixture copy (plain repos + the suite's git-built revision repo;
+  # see its doc comment). The suite is pinned: it is canonical, not a
+  # rolling dependency — bumps are deliberate, one tag at a time.
   forge-conformance:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check out the conformance suite
+      - name: Check out the conformance suite (pinned)
         uses: actions/checkout@v7
         with:
           repository: rootledev/forge-conformance
+          ref: v1.5.1
           path: forge
 
       - name: Rust toolchain
@@ -40,17 +42,6 @@ jobs:
       - name: Install pytest
         run: python -m pip install pytest
 
-      # TODO(FC-093, reported upstream): the suite demands
-      # same-content -> same-id across refs ("ids are content-keyed,
-      # not ref-keyed"); this adapter's ids are <commit>:<path>
-      # because Bitbucket Cloud's listings expose no git blob ids —
-      # content-keying would mean fetching every blob per tree walk.
-      # Unpassable without an owner call (suite relaxation or a
-      # fetching id scheme); deselected until then. Everything else in
-      # the 47-case matrix runs: 45 pass, FC-098 skips by capability
-      # (blame:false — Bitbucket Cloud has no blame API).
       - name: Suite vs the adapter (47 cases)
         working-directory: forge
-        run: |
-          PROVIDER=../target/debug/examples/forge_conformance python3 -m pytest cases -ra --tb=short \
-            --deselect cases/test_revisions.py::test_FC093_sha_discipline_across_refs
+        run: python3 run -- ../target/debug/examples/forge_conformance

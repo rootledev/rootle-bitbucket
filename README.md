@@ -13,7 +13,7 @@ first.
 Speaks the [rootle stdio provider protocol](https://github.com/rootledev/rootle/blob/main/doc/provider-protocol.md)
 (v1.5) over Bitbucket Cloud's REST 2.0 API, and is gated by
 [rootledev/forge-conformance](https://github.com/rootledev/forge-conformance)
-(v1.5.0, 47 cases) in CI. Shares no code with rootle; the wire
+(v1.5.1, 47 cases) in CI. Shares no code with rootle; the wire
 contract is the entire interface.
 
 ## Install
@@ -89,14 +89,10 @@ Repositories — Read). Set `BITBUCKET_LIVE_WORKSPACE` as a repo
 
 Correctness is gated by
 [rootledev/forge-conformance](https://github.com/rootledev/forge-conformance)
-(v1.5.0, 47 cases) on every push. The harness is
+(v1.5.1, 47 cases) on every push. The harness is
 `examples/forge_conformance`: the real adapter serving the canonical
 fixture through an in-process Bitbucket mock — plain directories for
-the frozen repos, git itself for the suite's revision repo. One case
-is currently deselected with a TODO in the workflow (FC-093 pins
-same-content → same-id across refs; this adapter's ids are
-`<commit>:<path>` because Bitbucket Cloud exposes no blob ids —
-pending an owner call). Locally:
+the frozen repos, git itself for the suite's revision repo. Locally:
 
 ```
 cargo build --locked --example forge_conformance
