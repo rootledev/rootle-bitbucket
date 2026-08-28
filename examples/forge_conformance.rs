@@ -1,8 +1,8 @@
 //! forge-conformance harness: this process IS the provider — it
-//! serves rootledev/forge-conformance's canonical fixture (two repos,
-//! `alpha` and `beta`) through the real adapter (`rootle_bitbucket`)
-//! against an in-process Bitbucket Cloud REST 2.0 mock backed by the
-//! fixture directory.
+//! serves rootledev/forge-conformance's canonical fixture (three
+//! repos, `alpha`, `beta`, `vcs`) through the real adapter
+//! (`rootle_bitbucket`) against an in-process Bitbucket Cloud REST
+//! 2.0 mock backed by the fixture directory.
 //!
 //!     PROVIDER=target/debug/examples/forge_conformance python3 run
 //!
@@ -10,14 +10,22 @@
 //! element and exports FORGE_FIXTURE_DIR; FORGE_ORG names the
 //! workspace, default `local`.)
 //!
-//! The mock's "commits" are content-derived (FNV-1a over the sorted
-//! repo files): mutating a fixture file moves the head, so the
-//! adapter's `<commit>:<path>` content ids move with it — exactly the
-//! semantics FC-011 pins. Everything is computed per request; nothing
-//! is snapshotted at startup. Credentials are satisfied in-process
-//! with dummies (the mock ignores them): the adapter's no-anonymous
-//! guard is about real Bitbucket, and the suite scrubs credential
-//! vars from the child env by contract (FC-052).
+//! Two backends behind the same endpoints:
+//!
+//! - plain directories (`alpha`, `beta`): served as files, with
+//!   content-derived "commits" (FNV-1a over the sorted files) so an
+//!   FC-011 mutation moves the head and with it every
+//!   `<commit>:<path>` content id;
+//! - real git repos (`vcs`, built by the suite's materializer): refs,
+//!   trees, blobs, and log served from git itself via the `git` CLI —
+//!   the suite computes its expectations from the same repo, so the
+//!   answers are git's answers (FC-090..FC-098, protocol v1.5).
+//!
+//! Everything is computed per request; nothing is snapshotted at
+//! startup. Credentials are satisfied in-process with dummies (the
+//! mock ignores them): the adapter's no-anonymous guard is about real
+//! Bitbucket, and the suite scrubs credential vars from the child env
+//! by contract (FC-052).
 
 use rootle_bitbucket::{Handler, respond};
 use serde_json::{Value, json};
@@ -84,10 +92,11 @@ fn main() {
     }
 }
 
-/// The four endpoint families the adapter speaks to: workspace repo
-/// listings, single repos, branch heads, and src (directory entries
-/// vs raw file bytes — the format=entries query is the discriminator,
-/// mirroring the real API).
+/// The endpoint families the adapter speaks to: workspace repo
+/// listings, single repos, ref collections + single refs, commits
+/// (log), and src (directory entries vs raw file bytes — the
+/// format=entries query is the discriminator, mirroring the real
+/// API).
 async fn mount(server: &MockServer, root: &Path, org: &str) {
     let (root1, org1) = (root.to_path_buf(), org.to_string());
     Mock::given(method("GET"))
@@ -106,18 +115,34 @@ async fn mount(server: &MockServer, root: &Path, org: &str) {
     let root3 = root.to_path_buf();
     Mock::given(method("GET"))
         .and(path_regex(
-            r"^/2\.0/repositories/([^/]+)/([^/]+)/refs/branches/([^/]+)$",
+            r"^/2\.0/repositories/([^/]+)/([^/]+)/refs/(branches|tags)$",
         ))
-        .respond_with(move |req: &Request| branch_head(req.url.path(), &root3))
+        .respond_with(move |req: &Request| ref_collection(req.url.path(), &root3))
         .mount(server)
         .await;
 
-    let (root4, org4) = (root.to_path_buf(), org.to_string());
+    let root4 = root.to_path_buf();
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/2\.0/repositories/([^/]+)/([^/]+)/refs/(branches|tags)/([^/]+)$",
+        ))
+        .respond_with(move |req: &Request| single_ref(req.url.path(), &root4))
+        .mount(server)
+        .await;
+
+    let root5 = root.to_path_buf();
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/2\.0/repositories/([^/]+)/([^/]+)/commits$"))
+        .respond_with(move |req: &Request| commits(req, &root5))
+        .mount(server)
+        .await;
+
+    let (root6, org6) = (root.to_path_buf(), org.to_string());
     Mock::given(method("GET"))
         .and(path_regex(
             r"^/2\.0/repositories/([^/]+)/([^/]+)/src/([^/]+)(/.*)?$",
         ))
-        .respond_with(move |req: &Request| src(req, &root4, &org4))
+        .respond_with(move |req: &Request| src(req, &root6, &org6))
         .mount(server)
         .await;
 }
@@ -135,33 +160,178 @@ fn repo_listing(path: &str, root: &Path, org: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({ "values": values }))
 }
 
-/// `/2.0/repositories/{org}/{repo}` — mainbranch drives the head
-/// resolution; links keep the URL methods honest.
+/// `/2.0/repositories/{org}/{repo}` — mainbranch drives the default
+/// ref; links keep the URL methods honest. Git repos report their
+/// checked-out branch (the materialized vcs ends on main).
 fn single_repo(path: &str, root: &Path, org: &str) -> ResponseTemplate {
     let Some((_, repo)) = split_repo(path, org) else {
         return not_found();
     };
-    if !repo_dir(root, &repo).is_dir() {
+    let dir = repo_dir(root, &repo);
+    if !dir.is_dir() {
         return not_found();
     }
-    ResponseTemplate::new(200).set_body_json(repo_json(&format!("{org}/{repo}")))
+    let branch = git_text(&dir, &["symbolic-ref", "--short", "HEAD"])
+        .map(|b| b.trim().to_string())
+        .unwrap_or_else(|| "main".to_string());
+    ResponseTemplate::new(200)
+        .set_body_json(repo_json_with_branch(&format!("{org}/{repo}"), &branch))
 }
 
-/// `/2.0/repositories/{org}/{repo}/refs/branches/{branch}` — the head
-/// is derived from the repo's CURRENT content, per request.
-fn branch_head(path: &str, root: &Path) -> ResponseTemplate {
-    let Some(repo) = split_repo_head(path) else {
+/// `/2.0/repositories/{org}/{repo}/refs/{branches|tags}` — the ref
+/// listings (v1.5 `repo/refs`). Git-backed repos answer from git;
+/// plain repos have no refs to list.
+fn ref_collection(path: &str, root: &Path) -> ResponseTemplate {
+    let Some((repo, kind)) = split_ref_path(path) else {
         return not_found();
     };
-    let Some(commit) = commit_for(&repo_dir(root, &repo)) else {
+    let dir = repo_dir(root, &repo);
+    if !dir.is_dir() {
+        return not_found();
+    }
+    let values: Vec<Value> = ref_names(&dir, kind)
+        .into_iter()
+        .filter_map(|name| {
+            let full = format!("{}/{name}", git_ref_prefix(kind));
+            git_text(
+                &dir,
+                &["rev-parse", "--verify", &format!("{full}^{{commit}}")],
+            )
+            .map(|sha| {
+                let sha = sha.trim().to_string();
+                json!({ "name": name, "target": { "hash": sha } })
+            })
+        })
+        .collect();
+    ResponseTemplate::new(200).set_body_json(json!({ "values": values }))
+}
+
+/// `/2.0/repositories/{org}/{repo}/refs/{kind}/{name}` — one ref's
+/// commit (the adapter's ref-resolution probe order). Git-backed
+/// repos deref through git; plain repos answer only the branch head
+/// (the content-derived one).
+fn single_ref(path: &str, root: &Path) -> ResponseTemplate {
+    let Some((repo, kind, name)) = split_single_ref(path) else {
         return not_found();
     };
-    ResponseTemplate::new(200).set_body_json(json!({ "target": { "hash": commit } }))
+    let dir = repo_dir(root, &repo);
+    if !dir.is_dir() {
+        return not_found();
+    }
+    let hash = if is_git(&dir) {
+        let full = format!("{}/{name}", git_ref_prefix(kind));
+        git_text(
+            &dir,
+            &["rev-parse", "--verify", &format!("{full}^{{commit}}")],
+        )
+        .map(|s| s.trim().to_string())
+    } else if kind == "branches" {
+        commit_for(&dir)
+    } else {
+        None
+    };
+    match hash {
+        Some(hash) => ResponseTemplate::new(200).set_body_json(json!({
+            "target": { "hash": hash }
+        })),
+        None => not_found(),
+    }
+}
+
+/// `/2.0/repositories/{org}/{repo}/commits?include=&pagelen=&path=`
+/// — the log (v1.5 `repo/log`), newest first, honestly paginated:
+/// a `next` link rides every page that is not the whole history (the
+/// adapter's truncation reads it).
+fn commits(req: &Request, root: &Path) -> ResponseTemplate {
+    let path = req.url.path();
+    let Some(repo) = path
+        .strip_prefix("/2.0/repositories/")
+        .and_then(|rest| rest.split('/').nth(1))
+        .map(percent_decode)
+    else {
+        return not_found();
+    };
+    let dir = repo_dir(root, &repo);
+    if !is_git(&dir) {
+        return not_found();
+    }
+    let query = query_map(req);
+    let include = query.get("include").cloned().unwrap_or_default();
+    if git_text(
+        &dir,
+        &["rev-parse", "--verify", &format!("{include}^{{commit}}")],
+    )
+    .is_none()
+    {
+        return not_found();
+    }
+    let pagelen: usize = query
+        .get("pagelen")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(100)
+        .max(1);
+    let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    let history_path = query.get("path").map(|p| percent_decode(p));
+
+    let mut total_args: Vec<&str> = vec!["rev-list", "--count", &include];
+    if let Some(p) = history_path.as_deref() {
+        total_args.extend(["--", p]);
+    }
+    let total: usize = git_text(&dir, &total_args)
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0);
+
+    let log_args: Vec<String> = vec![
+        "log".into(),
+        "--format=%H%x00%s%x00%an <%ae>%x00%aI".into(),
+        format!("--skip={}", (page - 1) * pagelen),
+        format!("-n{pagelen}"),
+        include.clone(),
+    ];
+    let mut log_args_ref: Vec<&str> = log_args.iter().map(String::as_str).collect();
+    if let Some(p) = history_path.as_deref() {
+        log_args_ref.extend(["--", p]);
+    }
+    let values: Vec<Value> = git_text(&dir, &log_args_ref)
+        .map(|out| {
+            out.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|line| {
+                    let mut parts = line.split('\u{0}');
+                    let hash = parts.next().unwrap_or_default();
+                    let subject = parts.next().unwrap_or_default();
+                    let author = parts.next().unwrap_or_default();
+                    let date = parts.next().unwrap_or_default();
+                    json!({
+                        "hash": hash,
+                        "message": subject,
+                        "author": { "raw": author },
+                        "date": date,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut body = json!({ "values": values });
+    if page * pagelen < total {
+        let mut next = format!(
+            "/2.0/repositories/{repo}/commits?include={include}&pagelen={pagelen}&page={}",
+            page + 1
+        );
+        if let Some(p) = history_path.as_deref() {
+            next.push_str("&path=");
+            next.push_str(p);
+        }
+        body["next"] = json!(next);
+    }
+    ResponseTemplate::new(200).set_body_json(body)
 }
 
 /// `/2.0/repositories/{org}/{repo}/src/{commit}[/{path}]` — directory
 /// entries (format=entries, paths repo-root-relative as the live API
-/// serves them) or the raw file bytes.
+/// serves them) or the raw file bytes. Git-backed repos answer at the
+/// COMMIT (ls-tree / cat-file); plain repos serve the directory and
+/// derive heads from content.
 fn src(req: &Request, root: &Path, org: &str) -> ResponseTemplate {
     let path = req.url.path();
     // Anchor on the FIRST /src/ — the repo itself has a `src/`
@@ -173,15 +343,39 @@ fn src(req: &Request, root: &Path, org: &str) -> ResponseTemplate {
         return not_found();
     };
     let after = &path[pos + "/src/".len()..];
-    // First segment after /src/ is the commit the branch-head endpoint
-    // handed out; the rest is the repo-relative path. The mock has no
-    // history — it always serves the CURRENT content, so a stale
-    // commit simply resolves to now.
-    let rel = after
-        .split_once('/')
-        .map(|(_, r)| percent_decode(r))
-        .unwrap_or_default();
+    // First segment after /src/ is the commit the ref endpoints handed
+    // out; the rest is the repo-relative path.
+    let (commit, rel) = match after.split_once('/') {
+        Some((c, r)) => (c.to_string(), percent_decode(r)),
+        None => (after.to_string(), String::new()),
+    };
     let dir = repo_dir(root, &repo);
+    if is_git(&dir) {
+        // A commit git cannot verify is a missing tree (FC-092's sha
+        // probe 404s in walk_tree, not just at resolution).
+        if git_text(
+            &dir,
+            &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+        )
+        .is_none()
+        {
+            return not_found();
+        }
+        let rel = rel.trim_end_matches('/');
+        if req
+            .url
+            .query()
+            .is_some_and(|q| q.contains("format=entries"))
+        {
+            return git_dir_listing(&dir, &commit, rel);
+        }
+        let spec = format!("{commit}:{rel}");
+        return match git_bytes(&dir, &["show", &spec]) {
+            Some(bytes) => ResponseTemplate::new(200).set_body_bytes(bytes),
+            None => not_found(),
+        };
+    }
+    // Plain backend: no history — serve the CURRENT content.
     if req
         .url
         .query()
@@ -197,7 +391,49 @@ fn src(req: &Request, root: &Path, org: &str) -> ResponseTemplate {
     }
 }
 
-/// One directory level at a pinned commit, paths repo-root-relative.
+/// `({repo}, {branches|tags})` from a refs-collection path.
+fn split_ref_path(path: &str) -> Option<(String, &'static str)> {
+    let rest = path.strip_prefix("/2.0/repositories/")?;
+    let mut it = rest.split('/');
+    let _ws = it.next()?;
+    let repo = it.next()?;
+    if it.next()? != "refs" {
+        return None;
+    }
+    let kind = match it.next()? {
+        "branches" => "branches",
+        "tags" => "tags",
+        _ => return None,
+    };
+    if it.next().is_some() {
+        return None;
+    }
+    Some((percent_decode(repo), kind))
+}
+
+/// `({repo}, {kind}, {name})` from a single-ref path.
+fn split_single_ref(path: &str) -> Option<(String, &'static str, String)> {
+    let rest = path.strip_prefix("/2.0/repositories/")?;
+    let mut it = rest.split('/');
+    let _ws = it.next()?;
+    let repo = it.next()?;
+    if it.next()? != "refs" {
+        return None;
+    }
+    let kind = match it.next()? {
+        "branches" => "branches",
+        "tags" => "tags",
+        _ => return None,
+    };
+    let name = it.next()?.to_string();
+    if it.next().is_some() {
+        return None;
+    }
+    Some((percent_decode(repo), kind, name))
+}
+
+/// One directory level of a plain (non-git) repo, paths
+/// repo-root-relative.
 fn dir_listing(dir: &Path, rel: &str) -> ResponseTemplate {
     let full = if rel.is_empty() {
         dir.to_path_buf()
@@ -210,6 +446,9 @@ fn dir_listing(dir: &Path, rel: &str) -> ResponseTemplate {
     let mut rows: Vec<(String, bool, u64)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" {
+            continue;
+        }
         let path = if rel.is_empty() {
             name
         } else {
@@ -238,14 +477,54 @@ fn dir_listing(dir: &Path, rel: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({ "values": values }))
 }
 
+/// `git ls-tree -l` at a commit: one level, repo-root-relative paths.
+fn git_dir_listing(dir: &Path, commit: &str, rel: &str) -> ResponseTemplate {
+    let prefix = if rel.is_empty() {
+        String::new()
+    } else {
+        format!("{rel}/")
+    };
+    let mut args: Vec<String> = vec!["ls-tree".into(), "-l".into(), commit.to_string()];
+    if !prefix.is_empty() {
+        args.push(prefix);
+    }
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some(out) = git_text(dir, &args_ref) else {
+        return not_found();
+    };
+    let values: Vec<Value> = out
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            // <mode> <type> <object> <size>\t<path>
+            let (meta, path) = line.split_once('\t')?;
+            let mut fields = meta.split_whitespace();
+            let _mode = fields.next()?;
+            let kind = fields.next()?;
+            let is_dir = kind == "tree";
+            let size: u64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            if is_dir {
+                Some(json!({ "type": "commit_directory", "path": path }))
+            } else {
+                Some(json!({ "type": "commit_file", "path": path, "size": size }))
+            }
+        })
+        .collect();
+    ResponseTemplate::new(200).set_body_json(json!({ "values": values }))
+}
+
 fn not_found() -> ResponseTemplate {
     ResponseTemplate::new(404).set_body_json(json!({ "error": { "message": "not found" } }))
 }
 
 fn repo_json(full_name: &str) -> Value {
+    repo_json_with_branch(full_name, "main")
+}
+
+fn repo_json_with_branch(full_name: &str, branch: &str) -> Value {
     json!({
         "full_name": full_name,
-        "mainbranch": { "name": "main" },
+        "mainbranch": { "name": branch },
         "links": {
             "html": { "href": format!("https://bitbucket.org/{full_name}") },
             "clone": [
@@ -256,7 +535,8 @@ fn repo_json(full_name: &str) -> Value {
 }
 
 /// `{org}/{repo}` from a `/2.0/repositories/{org}/{repo}` path (the
-/// part before /src/ or /refs/). None when the workspace mismatches.
+/// part before /src/, /refs/, or /commits). None when the workspace
+/// mismatches.
 fn split_repo(path: &str, org: &str) -> Option<(String, String)> {
     let rest = path.strip_prefix("/2.0/repositories/")?;
     let mut it = rest.split('/');
@@ -266,20 +546,6 @@ fn split_repo(path: &str, org: &str) -> Option<(String, String)> {
         return None;
     }
     Some((ws.to_string(), percent_decode(repo)))
-}
-
-/// The repo segment of a `/2.0/repositories/{org}/{repo}/refs/...`
-/// path.
-fn split_repo_head(path: &str) -> Option<String> {
-    let rest = path.strip_prefix("/2.0/repositories/")?;
-    let mut it = rest.split('/');
-    let ws = it.next()?;
-    let repo = it.next()?;
-    if it.next()? != "refs" || it.next()? != "branches" {
-        return None;
-    }
-    let _ = ws;
-    Some(percent_decode(repo))
 }
 
 fn repo_dir(root: &Path, repo: &str) -> PathBuf {
@@ -299,9 +565,75 @@ fn repo_dirs(root: &Path) -> Vec<String> {
     names
 }
 
+/// A repo the suite's materializer built with git (fixture/vcs).
+fn is_git(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
+fn git_text(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn git_bytes(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(out.stdout)
+}
+
+fn ref_names(dir: &Path, kind: &str) -> Vec<String> {
+    let prefix = format!("{}/", git_ref_prefix(kind));
+    let Some(out) = git_text(dir, &["for-each-ref", &prefix, "--format=%(refname:short)"]) else {
+        return Vec::new();
+    };
+    out.lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The wire says `refs/branches`; git keeps branches under
+/// `refs/heads` (Bitbucket's URL grammar predates git's layout).
+fn git_ref_prefix(kind: &str) -> &'static str {
+    match kind {
+        "branches" => "refs/heads",
+        _ => "refs/tags",
+    }
+}
+
+/// The query string as a map (first occurrence wins; keys and values
+/// percent-decoded).
+fn query_map(req: &Request) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(q) = req.url.query() {
+        for pair in q.split('&') {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            map.entry(percent_decode(k))
+                .or_insert_with(|| percent_decode(v));
+        }
+    }
+    map
+}
+
 /// Content-derived head: FNV-1a over the sorted repo files (path,
 /// length, bytes). Any content change moves the "commit", which is
-/// the whole fixture backend — there is no history to serve, only
+/// the whole plain-dir backend — there is no history to serve, only
 /// now. Deterministic across processes (FC-013) and sensitive to
 /// mutations (FC-011).
 fn commit_for(dir: &Path) -> Option<String> {
@@ -327,6 +659,9 @@ fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" {
+            continue;
+        }
         let rel = if prefix.is_empty() {
             name
         } else {
